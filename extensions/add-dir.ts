@@ -3,25 +3,30 @@
  *
  * Features:
  *   - Interactive Tab path completion with ~/ expansion
+ *   - Smart directory suggestions based on project structure
  *   - AGENTS.md / CLAUDE.md scanning and injection
  *   - Skill discovery and registration via resources_discover
  *   - Status widget showing active directories
  *   - LLM tool add_directory for agent-requested directory adds
+ *   - LLM tool search_external_files for cross-directory file search
  *   - Session persistence across /resume and restarts
  *
  * Commands:
  *   /add-dir <path>     — add a directory (with Tab completion)
+ *   /add-dir            — interactive mode with smart suggestions
  *   /add-dir ls         — list added directories
  *   /add-dir rm <index> — remove directory by index
  *   /dirs               — list all external directories with context details
- *   /remove-dir [path]  — remove a directory (interactive picker if no path, tab-completion supported)
+ *   /remove-dir [path]  — remove a directory (interactive picker or tab-completion)
+ *   /suggest-dirs       — show directory suggestions based on project structure
  */
 import type { ExtensionAPI, AutocompleteItem, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import { Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { readdir } from "node:fs/promises";
-import { readFileSync, statSync, readdirSync } from "node:fs";
-import { resolve, dirname, join, isAbsolute, basename } from "node:path";
+import { spawnSync } from "node:child_process";
+import { readdir, stat } from "node:fs/promises";
+import { readFileSync, statSync, readdirSync, existsSync } from "node:fs";
+import path, { resolve, dirname, join, isAbsolute, basename } from "node:path";
 
 // ——— Types ———
 
@@ -38,6 +43,13 @@ interface DirContext {
   skills: Map<string, string>;
 }
 
+interface Suggestion {
+  absolutePath: string;
+  label: string;
+  score: number;
+  reasons: string[];
+}
+
 // ——— Constants ———
 
 const CONTEXT_PATHS = [
@@ -45,10 +57,14 @@ const CONTEXT_PATHS = [
   (d: string) => join(d, ".pi"),
 ] as const;
 
-const SKILL_DIRS = [
-  ".pi/skills",
-  ".agents/skills",
-  ".claude/skills",
+const SKILL_DIRS = [".pi/skills", ".agents/skills", ".claude/skills"] as const;
+
+const PROJECT_MARKERS = [
+  "package.json", ".git", "Cargo.toml", "go.mod",
+  "pyproject.toml", "Gemfile", "Rakefile", "pom.xml",
+  "build.gradle", "build.gradle.kts", "mix.exs", "Makefile",
+  "CMakeLists.txt", "setup.py", "setup.cfg", "deno.json",
+  "project.json", "composer.json", "Package.swift", "pubspec.yaml",
 ] as const;
 
 // ——— Helpers ———
@@ -79,7 +95,6 @@ function resolveDir(input: string, cwd: string): string {
 /** Scan a directory for context files and skills. */
 function scanDirContext(dir: string): DirContext {
   const ctx: DirContext = { dir, agentsMd: null, claudeMd: null, skills: new Map() };
-
   for (const baseFn of CONTEXT_PATHS) {
     const baseDir = baseFn(dir);
     const agents = readFileSafe(join(baseDir, "AGENTS.md"));
@@ -87,7 +102,6 @@ function scanDirContext(dir: string): DirContext {
     if (agents) ctx.agentsMd = ctx.agentsMd ? ctx.agentsMd + "\n\n" + agents : agents;
     if (claude) ctx.claudeMd = ctx.claudeMd ? ctx.claudeMd + "\n\n" + claude : claude;
   }
-
   for (const skillBase of SKILL_DIRS) {
     const full = join(dir, skillBase);
     if (!dirExists(full)) continue;
@@ -100,7 +114,6 @@ function scanDirContext(dir: string): DirContext {
       }
     } catch { /* skip */ }
   }
-
   return ctx;
 }
 
@@ -131,7 +144,6 @@ function invalidateContextCache(): void { contextCache = null; }
 
 function buildContextInjection(dirs: AddedDir[]): string {
   if (dirs.length === 0) return "";
-
   const cacheKey = dirs.map(d => d.absolutePath).sort().join("\0");
   if (contextCache && contextCache.dirs === cacheKey) return contextCache.injection;
 
@@ -141,14 +153,11 @@ function buildContextInjection(dirs: AddedDir[]): string {
     `\nThe following ${dirs.length} external director${dirs.length === 1 ? "y is" : "ies are"} ` +
     `included in this session. You can read, edit, and write files using absolute paths.\n`
   );
-
   for (const dir of dirs) {
     const ctx = scanDirContext(dir.absolutePath);
     sections.push(`### ${dir.label} — \`${dir.absolutePath}\``);
-
     if (ctx.agentsMd) sections.push(`\n#### AGENTS.md\n${ctx.agentsMd}`);
     if (ctx.claudeMd) sections.push(`\n#### CLAUDE.md\n${ctx.claudeMd}`);
-
     if (ctx.skills.size > 0) {
       sections.push(`\n#### Skills (registered as /skill:name commands):`);
       for (const [name, content] of ctx.skills) {
@@ -156,7 +165,6 @@ function buildContextInjection(dirs: AddedDir[]): string {
         sections.push(`- **${name}**: ${desc} — use \`/skill:${name}\``);
       }
     }
-
     try {
       const top = readdirSync(dir.absolutePath, { withFileTypes: true })
         .filter(e => !e.name.startsWith(".") || e.name === ".pi" || e.name === ".agents")
@@ -165,7 +173,6 @@ function buildContextInjection(dirs: AddedDir[]): string {
       if (top.length) sections.push(`\n<details><summary>Directory contents</summary>\n\n${top.join("\n")}\n</details>`);
     } catch { /* skip */ }
   }
-
   const injection = sections.join("\n");
   contextCache = { dirs: cacheKey, injection };
   return injection;
@@ -175,22 +182,22 @@ function buildContextInjection(dirs: AddedDir[]): string {
 
 function updateWidget(ctx: ExtensionContext, dirs: AddedDir[]) {
   if (!ctx.hasUI || dirs.length === 0) { ctx.ui.setWidget("add-dir", undefined); return; }
-
   ctx.ui.setWidget("add-dir", (_tui, theme) => ({
-    dispose() {},
-    invalidate() {},
+    dispose() {}, invalidate() {},
     render(width: number): string[] {
       const prefix = theme.fg("accent", "📂");
       const count = theme.fg("muted", ` ${dirs.length} dir${dirs.length > 1 ? "s" : ""}`);
-      const sep = theme.fg("dim", " │ ");
+      const sep = theme.fg("dim", " | ");
       const suffix = theme.fg("dim", "  (/dirs to manage)");
       const labels = dirs.map(d => theme.fg("text", d.label)).join(theme.fg("dim", ", "));
       const full = ` ${prefix}${count}${sep}${labels}${suffix}`;
-      if (full.length <= width) return [full];
-
-      const overhead = ` ${prefix}${count}${sep}`.length + suffix.length;
-      const avail = width - overhead;
-      if (avail > 5) return [` ${prefix}${count}${sep}${labels.slice(0, avail)}…${suffix}`];
+      const fullWidth = full.replace(/\x1b\[[0-9;]*m/g, "").length;
+      if (fullWidth <= width) return [full];
+      const base = ` ${prefix}${count}${sep}`;
+      const baseW = base.replace(/\x1b\[[0-9;]*m/g, "").length;
+      const suW = suffix.replace(/\x1b\[[0-9;]*m/g, "").length;
+      const avail = width - baseW - suW;
+      if (avail > 5) return [`${base}${truncateToWidth(labels, avail, "...")}${suffix}`];
       return [` ${prefix}${count}`];
     },
   }));
@@ -199,9 +206,7 @@ function updateWidget(ctx: ExtensionContext, dirs: AddedDir[]) {
 // ——— Autocompletion ———
 
 async function listDirectory(
-  dirPath: string,
-  filter = "",
-  rebasePrefix = ""
+  dirPath: string, filter = "", rebasePrefix = ""
 ): Promise<AutocompleteItem[]> {
   try {
     const entries = await readdir(dirPath, { withFileTypes: true });
@@ -210,9 +215,7 @@ async function listDirectory(
       if (filter && !entry.name.toLowerCase().startsWith(filter.toLowerCase())) continue;
       const isDir = entry.isDirectory();
       let value = join(dirPath, entry.name) + (isDir ? "/" : "");
-      if (rebasePrefix && dirPath.startsWith("/")) {
-        value = rebasePrefix + value.slice(dirPath.length);
-      }
+      if (rebasePrefix && dirPath.startsWith("/")) value = rebasePrefix + value.slice(dirPath.length);
       items.push({ value, label: `${isDir ? "📁" : "📄"} ${entry.name}` });
     }
     items.sort((a, b) => {
@@ -236,97 +239,237 @@ function getCompletions(prefix: string, cwd: string): Promise<AutocompleteItem[]
   return listDirectory(basePath, filter, tildePrefix);
 }
 
+// ——— Smart Suggestions Engine ———
+
+interface Candidate { dir: string; reasons: string[]; weight: number }
+
+function findGitRoot(cwd: string): string | null {
+  let current = cwd;
+  for (let i = 0; i < 10; i++) {
+    if (dirExists(join(current, ".git"))) return current;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+  return null;
+}
+
+function findWorkspaceRoot(cwd: string): string | null {
+  let current = cwd;
+  for (let i = 0; i < 10; i++) {
+    let files: Set<string>;
+    try { files = new Set(readdirSync(current)); }
+    catch { current = dirname(current); continue; }
+    if (files.has("pnpm-workspace.yaml") || files.has("go.work")) return current;
+    if (files.has("package.json")) {
+      try { const pkg = JSON.parse(readFileSafe(join(current, "package.json"))!); if (pkg.workspaces) return current; } catch {}
+    }
+    if (files.has("Cargo.toml")) { const c = readFileSafe(join(current, "Cargo.toml")); if (c?.includes("[workspace]")) return current; }
+    if (files.has("pyproject.toml")) { const p = readFileSafe(join(current, "pyproject.toml")); if (p?.includes("[tool.uv.workspace]")) return current; }
+    if ([...files].some(f => f.endsWith(".sln"))) return current;
+    if (files.has("settings.gradle") || files.has("settings.gradle.kts")) return current;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+  return null;
+}
+
+function isProject(dir: string): boolean {
+  return PROJECT_MARKERS.some(m => existsSync(join(dir, m)));
+}
+
+const gitRootCache = new Map<string, string | null>();
+
+function collectPathsFromFile(cwd: string, file: string, rx: RegExp, reason: string, weight: number): Candidate[] {
+  const content = readFileSafe(join(cwd, file));
+  if (!content) return [];
+  const out: Candidate[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(content))) {
+    const rel = m[1]; if (!rel) continue;
+    const abs = path.resolve(cwd, rel);
+    if (dirExists(abs)) out.push({ dir: abs, reasons: [reason], weight });
+  }
+  return out;
+}
+
+function collectNpmDeps(cwd: string): Candidate[] {
+  const pkg = readFileSafe(join(cwd, "package.json"));
+  if (!pkg) return [];
+  const out: Candidate[] = [];
+  try {
+    const parsed = JSON.parse(pkg);
+    const all = { ...parsed.dependencies, ...parsed.devDependencies };
+    for (const [name, ver] of Object.entries(all)) {
+      if (typeof ver !== "string") continue;
+      for (const proto of ["file:", "link:", "portal:"]) {
+        if (ver.startsWith(proto)) {
+          const abs = path.resolve(cwd, ver.slice(proto.length));
+          if (dirExists(abs)) out.push({ dir: abs, reasons: [`${proto} dep (${name})`], weight: 0.6 });
+        }
+      }
+    }
+  } catch {}
+  return out;
+}
+
+function collectSiblings(cwd: string): Candidate[] {
+  const parent = dirname(cwd);
+  if (parent === cwd) return [];
+  const cwdRoot = findGitRoot(cwd);
+  const out: Candidate[] = [];
+  try {
+    for (const entry of readdirSync(parent, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+      const full = join(parent, entry.name);
+      if (full === cwd || !isProject(full)) continue;
+      const sibRoot = findGitRoot(full);
+      const same = cwdRoot && sibRoot && cwdRoot === sibRoot;
+      const hasCtx = CONTEXT_PATHS.some(fn => {
+        const base = fn(full);
+        return existsSync(join(base, "AGENTS.md")) || existsSync(join(base, "CLAUDE.md"));
+      });
+      if (same) out.push({ dir: full, reasons: ["sibling (same repo)"], weight: 0.35 });
+      else if (hasCtx) out.push({ dir: full, reasons: ["sibling (context files)"], weight: 0.25 });
+      else out.push({ dir: full, reasons: ["sibling project"], weight: 0.2 });
+    }
+  } catch {}
+  return out;
+}
+
+function collectWorkspaceMembers(cwd: string): Candidate[] {
+  const root = findWorkspaceRoot(cwd);
+  if (!root) return [];
+  const out: Candidate[] = [];
+  try {
+    const pkg = JSON.parse(readFileSafe(join(root, "package.json"))!);
+    const patterns: string[] = Array.isArray(pkg.workspaces) ? pkg.workspaces : pkg.workspaces?.packages ?? [];
+    for (const pat of patterns) {
+      if (pat.endsWith("/*")) {
+        const base = join(root, pat.slice(0, -2));
+        if (dirExists(base)) {
+          for (const e of readdirSync(base, { withFileTypes: true })) {
+            if (!e.isDirectory() || e.name.startsWith(".")) continue;
+            const full = join(base, e.name);
+            if (full !== cwd && isProject(full)) out.push({ dir: full, reasons: ["workspace member"], weight: 0.5 });
+          }
+        }
+      } else {
+        const abs = path.resolve(root, pat);
+        if (abs !== cwd && dirExists(abs) && isProject(abs)) out.push({ dir: abs, reasons: ["workspace member"], weight: 0.5 });
+      }
+    }
+  } catch {}
+  return out;
+}
+
+function gatherSuggestions(cwd: string, alreadyAdded: string[]): Suggestion[] {
+  const candidates: Candidate[] = [
+    ...collectSiblings(cwd),
+    ...collectNpmDeps(cwd),
+    ...collectPathsFromFile(cwd, "Cargo.toml", /path\s*=\s*"([^"]+)"/g, "Cargo path dep", 0.6),
+    ...collectPathsFromFile(cwd, "tsconfig.json", /"path"\s*:\s*"([^"]+)"/g, "TS project ref", 0.55),
+    ...collectPathsFromFile(cwd, "mix.exs", /\{:\w+\s*,\s*path:\s*"([^"]+)"/g, "Elixir mix.exs", 0.6),
+    ...collectPathsFromFile(cwd, "Pubspec.yaml", /path:\s*['"]?(\.\.\/[^'"\s]+|\.\/.+)['"]?/g, "pubspec path", 0.6),
+    ...collectWorkspaceMembers(cwd),
+  ];
+
+  // Dedupe and score
+  const byPath = new Map<string, { reasons: string[]; weight: number }>();
+  for (const c of candidates) {
+    const ex = byPath.get(c.dir);
+    if (ex) { ex.reasons.push(...c.reasons); ex.weight += c.weight; }
+    else byPath.set(c.dir, { reasons: [...c.reasons], weight: c.weight });
+  }
+
+  const resolvedCwd = path.resolve(cwd);
+  const excluded = new Set([resolvedCwd, ...alreadyAdded]);
+
+  const suggestions: Suggestion[] = [];
+  for (const [dir, data] of byPath) {
+    if (excluded.has(dir) || resolvedCwd.startsWith(dir + path.sep)) continue;
+    let score = Math.min(data.weight, 1.0);
+    const hasCtx = CONTEXT_PATHS.some(fn => {
+      const b = fn(dir);
+      return existsSync(join(b, "AGENTS.md")) || existsSync(join(b, "CLAUDE.md"));
+    });
+    if (hasCtx) { score = Math.min(score + 0.25, 1.0); data.reasons.push("has context files"); }
+    suggestions.push({ absolutePath: dir, label: basename(dir), score: Math.round(score * 100) / 100, reasons: [...new Set(data.reasons)] });
+  }
+  suggestions.sort((a, b) => b.score - a.score || a.label.localeCompare(b.label));
+  return suggestions.slice(0, 10);
+}
+
 // ——— Extension ———
 
 export default function addDirExtension(pi: ExtensionAPI) {
   let addedDirs: AddedDir[] = [];
   let currentCwd = "";
 
-  // ——— State persistence ———
-
   function reconstructState(ctx: ExtensionContext) {
-    addedDirs = [];
-    currentCwd = ctx.cwd;
+    addedDirs = []; currentCwd = ctx.cwd;
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type === "custom" && entry.customType === "add-dir:state") {
         const data = (entry as { data?: { dirs: AddedDir[] } }).data;
         if (data?.dirs) addedDirs = data.dirs;
       }
     }
-    invalidateContextCache();
-    updateWidget(ctx, addedDirs);
+    invalidateContextCache(); updateWidget(ctx, addedDirs);
   }
 
-  function persistState() {
-    pi.appendEntry("add-dir:state", { dirs: addedDirs });
-  }
+  function persistState() { pi.appendEntry("add-dir:state", { dirs: addedDirs }); }
 
   pi.on("session_start", async (_e, ctx) => {
     reconstructState(ctx);
-    if (addedDirs.length > 0) {
-      ctx.ui.notify(`Loaded ${addedDirs.length} context director${addedDirs.length === 1 ? "y" : "ies"}`, "info");
-    }
+    if (addedDirs.length > 0) ctx.ui.notify(`Loaded ${addedDirs.length} context director${addedDirs.length === 1 ? "y" : "ies"}`, "info");
   });
 
-  // ——— Resources discovery (skills from added dirs) ———
-
   pi.on("resources_discover", (event, _ctx) => {
-    if (addedDirs.length === 0) return;
+    if (!addedDirs.length) return;
     const skillPaths = collectSkillPaths(addedDirs);
-    if (skillPaths.length === 0) return;
+    if (!skillPaths.length) return;
     return { skillPaths };
   });
 
-  // ——— Auto-reload tracker ———
-
+  // Auto-reload on skill change
   let dirsChanged = false;
-
-  function markDirsChanged() { dirsChanged = true; }
+  function markChanged() { dirsChanged = true; }
 
   pi.on("turn_start", async (_e, ctx) => {
     if (dirsChanged && addedDirs.length > 0) {
       const hasSkills = addedDirs.some(d => scanDirContext(d.absolutePath).skills.size > 0);
       if (hasSkills) {
-        dirsChanged = false; // prevent double reload
-        ctx.ui.notify("Reloading to register skills from external directories…", "info");
+        dirsChanged = false;
         setTimeout(() => pi.sendUserMessage("/reload", { deliverAs: "followUp" }), 100);
       }
     }
   });
 
-  // —── Commands ———
+  // ——— Commands ——
 
   pi.registerCommand("add-dir", {
-    description: "Add a directory to Pi's context with path Tab completion",
+    description: "Add a directory with Tab completion and smart suggestions",
     getArgumentCompletions: async (prefix) => {
       const t = prefix.trim();
       const cwd = pi.cwd || process.cwd();
-
       if (!t.includes("/") && !t.includes(".") && !t.startsWith("-")) {
         return [
           { value: "ls", label: "📋 list — Show added directories" },
           { value: "rm", label: "🗑 remove — Remove a directory" },
         ].filter(s => s.value.startsWith(t));
       }
-
       const rmMatch = t.match(/^(rm |--remove )/);
       if (rmMatch) {
         const numPart = t.slice(rmMatch[0].length).trim();
-        return addedDirs
-          .map((_d, i) => i)
-          .filter(n => String(n).startsWith(numPart))
-          .map(n => ({
-            value: `${n} ${addedDirs[n].absolutePath}`,
-            label: `${n}: ${addedDirs[n].label} (${addedDirs[n].absolutePath})`,
-          }));
+        return addedDirs.map((_d, i) => i).filter(n => String(n).startsWith(numPart))
+          .map(n => ({ value: `${n} ${addedDirs[n].absolutePath}`, label: `${n}: ${addedDirs[n].label} (${addedDirs[n].absolutePath})` }));
       }
-
       return getCompletions(prefix, cwd);
     },
     handler: async (args, ctx) => {
       const t = args.trim();
 
-      // LIST
       if (t === "ls" || t === "--list" || t === "-l") {
         if (!addedDirs.length) { ctx.ui.notify("No directories added", "info"); return; }
         const lines = addedDirs.map((d, i) => {
@@ -341,51 +484,71 @@ export default function addDirExtension(pi: ExtensionAPI) {
         return;
       }
 
-      // REMOVE
       const rmMatch = t.match(/^(rm |--remove )/);
       if (rmMatch) {
         const numStr = t.slice(rmMatch[0].length).trim();
         const idx = parseInt(numStr, 10);
-        if (isNaN(idx) || idx < 0 || idx >= addedDirs.length) {
-          ctx.ui.notify("Invalid index. Use: /add-dir rm <index>", "error"); return;
-        }
-        const removed = addedDirs.splice(idx, 1)[0];
-        invalidateContextCache(); persistState(); updateWidget(ctx, addedDirs); markDirsChanged();
-        ctx.ui.notify(`Removed: ${removed.absolutePath}`, "success");
-        return;
+        if (isNaN(idx) || idx < 0 || idx >= addedDirs.length) { ctx.ui.notify("Invalid index. Use: /add-dir rm <index>", "error"); return; }
+        addedDirs.splice(idx, 1); invalidateContextCache(); persistState(); updateWidget(ctx, addedDirs); markChanged();
+        ctx.ui.notify("Removed.", "success"); return;
       }
 
-      // USAGE
       if (!t) {
-        ctx.ui.notify("Usage: /add-dir <path>\n       /add-dir ls\n       /add-dir rm <index>", "info");
-        return;
+        // Smart suggestions
+        const sugs = gatherSuggestions(ctx.cwd, addedDirs.map(d => d.absolutePath));
+        if (sugs.length > 0) {
+          const choices = sugs.map(s => {
+            const reasons = s.reasons.slice(0, 2).join(", ");
+            return `${s.label} — ${s.absolutePath} (${reasons})`;
+          });
+          choices.push("📝 Enter a custom path...");
+          const sel = await ctx.ui.select("Suggested directories:", choices);
+          if (sel === undefined) return;
+          const idx = choices.indexOf(sel);
+          if (idx === -1 || idx === choices.length - 1) {
+            const custom = await ctx.ui.input("Directory path:", "");
+            if (!custom) return;
+            addResolvedDir(custom, ctx.cwd, ctx);
+            return;
+          }
+          addResolvedDir(sugs[idx].absolutePath, ctx.cwd, ctx);
+          return;
+        } else {
+          const custom = await ctx.ui.input("Directory path (no suggestions found):", "");
+          if (!custom) return;
+          addResolvedDir(custom, ctx.cwd, ctx);
+          return;
+        }
       }
 
-      // ADD
-      const resolved = resolveDir(t, ctx.cwd);
-      if (!dirExists(resolved)) { ctx.ui.notify(`Path not found: ${t}`, "error"); return; }
-      if (resolved === resolveDir(ctx.cwd, ctx.cwd)) { ctx.ui.notify("That's the current working directory — already in scope.", "info"); return; }
-      if (addedDirs.some(d => d.absolutePath === resolved)) { ctx.ui.notify(`Already added: ${resolved}`, "info"); return; }
-
-      const label = basename(resolved);
-      addedDirs.push({ absolutePath: resolved, label, addedAt: Date.now() });
-      invalidateContextCache(); persistState(); updateWidget(ctx, addedDirs); markDirsChanged();
-
-      const dirCtx = scanDirContext(resolved);
-      const found: string[] = [];
-      if (dirCtx.agentsMd) found.push("AGENTS.md");
-      if (dirCtx.claudeMd) found.push("CLAUDE.md");
-      if (dirCtx.skills.size) found.push(`${dirCtx.skills.size} skill(s)`);
-      let msg = `Added ${label} (${resolved}).`;
-      msg += found.length ? ` Found: ${found.join(", ")}.` : " No context files found.";
-      ctx.ui.notify(msg, "success");
+      addResolvedDir(t, ctx.cwd, ctx);
     },
   });
+
+  async function addResolvedDir(input: string, cwd: string, ctx: ExtensionContext) {
+    const resolved = resolveDir(input, cwd);
+    if (!dirExists(resolved)) { ctx.ui.notify(`Path not found: ${input}`, "error"); return; }
+    if (resolved === resolveDir(cwd, cwd)) { ctx.ui.notify("That's the current working directory — already in scope.", "info"); return; }
+    if (addedDirs.some(d => d.absolutePath === resolved)) { ctx.ui.notify(`Already added: ${resolved}`, "info"); return; }
+
+    const label = basename(resolved);
+    addedDirs.push({ absolutePath: resolved, label, addedAt: Date.now() });
+    invalidateContextCache(); persistState(); updateWidget(ctx, addedDirs); markChanged();
+
+    const dc = scanDirContext(resolved);
+    const found: string[] = [];
+    if (dc.agentsMd) found.push("AGENTS.md");
+    if (dc.claudeMd) found.push("CLAUDE.md");
+    if (dc.skills.size) found.push(`${dc.skills.size} skill(s)`);
+    let msg = `Added ${label} (${resolved}).`;
+    msg += found.length ? ` Found: ${found.join(", ")}.` : " No context files found.";
+    ctx.ui.notify(msg, "success");
+  }
 
   pi.registerCommand("dirs", {
     description: "List all external directories added to this session",
     handler: async (_args, ctx) => {
-      if (!addedDirs.length) { ctx.ui.notify("No external directories added. Use /add-dir <path> to add one.", "info"); return; }
+      if (!addedDirs.length) { ctx.ui.notify("No external directories added. Use /add-dir <path>.", "info"); return; }
       const lines: string[] = [`External directories (${addedDirs.length}):\n`];
       for (const dir of addedDirs) {
         const c = scanDirContext(dir.absolutePath);
@@ -427,13 +590,30 @@ export default function addDirExtension(pi: ExtensionAPI) {
       if (!absPath) return;
       const idx = addedDirs.findIndex(d => d.absolutePath === absPath);
       if (idx === -1) { ctx.ui.notify(`Not found: ${absPath}`, "error"); return; }
-      const removed = addedDirs.splice(idx, 1)[0];
-      invalidateContextCache(); persistState(); updateWidget(ctx, addedDirs); markDirsChanged();
-      ctx.ui.notify(`Removed ${removed.label} (${removed.absolutePath}).`, "success");
+      addedDirs.splice(idx, 1); invalidateContextCache(); persistState(); updateWidget(ctx, addedDirs); markChanged();
+      ctx.ui.notify("Removed.", "success");
     },
   });
 
-  // ——— System prompt injection ———
+  pi.registerCommand("suggest-dirs", {
+    description: "Show directory suggestions based on project structure",
+    handler: async (_args, ctx) => {
+      const sugs = gatherSuggestions(ctx.cwd, addedDirs.map(d => d.absolutePath));
+      if (!sugs.length) { ctx.ui.notify("No suggestions found. Try /add-dir <path> to add manually.", "info"); return; }
+      const choices = sugs.map(s => {
+        const score = Math.round(s.score * 100);
+        const reasons = s.reasons.slice(0, 2).join(", ");
+        return `${s.label} (${score}%) — ${reasons}`;
+      });
+      const sel = await ctx.ui.select("Suggested directories — pick to add:", choices);
+      if (sel === undefined) return;
+      const idx = choices.indexOf(sel);
+      if (idx === -1 || !sugs[idx]) return;
+      addResolvedDir(sugs[idx].absolutePath, ctx.cwd, ctx);
+    },
+  });
+
+  // ——— System prompt injection ——
 
   pi.on("before_agent_start", async (event, _ctx) => {
     if (!addedDirs.length) return;
@@ -442,27 +622,25 @@ export default function addDirExtension(pi: ExtensionAPI) {
     return { systemPrompt: event.systemPrompt + injection };
   });
 
-  // ——— LLM tool: add_directory ———
+  // ——— LLM tool: add_directory ——
 
   pi.registerTool({
     name: "add_directory",
     label: "Add Directory",
     description:
       "Add an external directory to this session so its AGENTS.md, CLAUDE.md, and skills are loaded into context. " +
-      "Use when you need to reference or work with code in a directory outside cwd. " +
-      "The directory's context files are injected into the system prompt automatically. " +
-      "After adding, you can read/edit/write files in that directory using absolute paths.",
-    promptSnippet: "Add an external directory to this session (loads its AGENTS.md, skills, etc.)",
+      "Use when you need to reference code in a directory outside cwd. " +
+      "After adding, you can read/edit/write files using absolute paths.",
+    promptSnippet: "Add an external directory to this session",
     promptGuidelines: [
-      "Use add_directory when you need context from another project or directory outside cwd.",
-      "The directory's AGENTS.md and CLAUDE.md are injected into the system prompt automatically.",
-      "After adding, you can read/edit/write files in the directory using absolute paths.",
+      "Use when you need context from a directory outside cwd.",
+      "The directory's AGENTS.md/CLAUDE.md are injected into the system prompt.",
     ],
     parameters: Type.Object({
       path: Type.String({ description: "Absolute or relative path to the directory to add" }),
       reason: Type.Optional(Type.String({ description: "Why this directory is being added (shown to user)" })),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolId, params, _signal, _onUpdate, ctx) {
       const dirPath = resolveDir(params.path.replace(/^@/, ""), ctx.cwd);
       if (!dirExists(dirPath)) throw new Error(`Directory does not exist: ${dirPath}`);
       if (addedDirs.some(d => d.absolutePath === dirPath)) {
@@ -470,28 +648,24 @@ export default function addDirExtension(pi: ExtensionAPI) {
       }
       const label = basename(dirPath);
       addedDirs.push({ absolutePath: dirPath, label, addedAt: Date.now() });
-      invalidateContextCache(); persistState(); updateWidget(ctx, addedDirs); markDirsChanged();
+      invalidateContextCache(); persistState(); updateWidget(ctx, addedDirs); markChanged();
 
       const dc = scanDirContext(dirPath);
       const resp: string[] = [`Added ${label} (${dirPath}).`];
-      if (dc.agentsMd) resp.push("AGENTS.md content has been injected into system context.");
-      if (dc.claudeMd) resp.push("CLAUDE.md content has been injected into system context.");
-      if (dc.skills.size) {
-        resp.push(`\nDiscovered skills: ${[...dc.skills.keys()].join(", ")}`);
-        resp.push("Skills will be registered after the turn completes.");
-      }
-      resp.push(`\nYou can now access files at: ${dirPath}`);
-
+      if (dc.agentsMd) resp.push("AGENTS.md injected.");
+      if (dc.claudeMd) resp.push("CLAUDE.md injected.");
+      if (dc.skills.size) resp.push(`Skills found: ${[...dc.skills.keys()].join(", ")}.`);
+      resp.push(`\nAccess files at: ${dirPath}`);
       return {
         content: [{ type: "text", text: resp.join("\n") }],
         details: { directory: dirPath, hasAgentsMd: !!dc.agentsMd, hasClaudeMd: !!dc.claudeMd, skillCount: dc.skills.size, skillNames: [...dc.skills.keys()] },
       };
     },
     renderCall(args, theme) {
-      let txt = theme.fg("toolTitle", theme.bold("add_directory "));
-      txt += theme.fg("accent", (args.path ?? "").replace(/^@/, ""));
-      if (args.reason) txt += theme.fg("dim", ` — ${args.reason}`);
-      return new Text(txt, 0, 0);
+      let t = theme.fg("toolTitle", theme.bold("add_directory "));
+      t += theme.fg("accent", (args.path ?? "").replace(/^@/, ""));
+      if (args.reason) t += theme.fg("dim", ` — ${args.reason}`);
+      return new Text(t, 0, 0);
     },
     renderResult(result, { expanded }, theme) {
       const d = result.details as { directory?: string; hasAgentsMd?: boolean; hasClaudeMd?: boolean; skillCount?: number; skillNames?: string[] } | undefined;
@@ -506,6 +680,78 @@ export default function addDirExtension(pi: ExtensionAPI) {
         parts.push("\n" + theme.fg("muted", "  Skills: ") + d.skillNames.map(s => theme.fg("text", s)).join(", "));
       }
       return new Text(parts.join(""), 0, 0);
+    },
+  });
+
+  // ——— LLM tool: search_external_files ——
+
+  pi.registerTool({
+    name: "search_external_files",
+    label: "Search External Files",
+    description:
+      "Search for files across all external directories added to this session. " +
+      "Use when you need to find a file in an external directory but don't know its exact path. " +
+      "Supports glob-style patterns like '*.ts', '**/*.test.js', 'src/**/*.rb'.",
+    promptSnippet: "Search for files across all added external directories by name pattern",
+    promptGuidelines: [
+      "Use when you need to find a file in an external directory but don't know its path.",
+      "Supports glob patterns: '*.ts', 'config/**', 'README.md'.",
+    ],
+    parameters: Type.Object({
+      pattern: Type.String({ description: "File name or glob pattern to search for (e.g., '*.ts', 'config/**')" }),
+      maxResults: Type.Optional(Type.Number({ description: "Maximum number of results (default: 50)" })),
+    }),
+    async execute(_toolId, params, signal, _onUpdate, _ctx) {
+      if (!addedDirs.length) throw new Error("No external directories added. Use /add-dir or add_directory first.");
+      const max = params.maxResults ?? 50;
+      const pattern = params.pattern.replace(/^@/, "");
+      const results: { dir: string; label: string; files: string[] }[] = [];
+      let total = 0;
+
+      for (const dir of addedDirs) {
+        if (signal?.aborted) break; if (!dirExists(dir.absolutePath)) continue;
+        const remaining = max - total; if (remaining <= 0) break;
+        try {
+          const hasSlash = pattern.includes("/");
+          const findFlag = hasSlash ? "-path" : "-name";
+          const result = spawnSync("find", [
+            dir.absolutePath, "-not", "-path", "*/node_modules/*", "-not", "-path", "*/.git/*",
+            findFlag, pattern, "-type", "f",
+          ], { encoding: "utf-8", timeout: 10_000 });
+          const files = (result.stdout ?? "").trim().split("\n").filter(Boolean).slice(0, remaining);
+          if (files.length > 0) { results.push({ dir: dir.absolutePath, label: dir.label, files }); total += files.length; }
+        } catch { /* skip */ }
+      }
+
+      if (!total) return { content: [{ type: "text", text: `No files matching "${pattern}" found in ${addedDirs.length} external director${addedDirs.length === 1 ? "y" : "ies"}.` }], details: { totalFound: 0, pattern } };
+
+      const lines: string[] = [`Found ${total} file(s) matching "${pattern}":\n`];
+      for (const r of results) {
+        lines.push(`📂 ${r.label} (${r.dir}):`);
+        for (const f of r.files) lines.push(`  ${f}`);
+        lines.push("");
+      }
+      return { content: [{ type: "text", text: lines.join("\n") }], details: { totalFound: total, pattern, dirCount: results.length } };
+    },
+    renderCall(args, theme) {
+      let t = theme.fg("toolTitle", theme.bold("search_external_files "));
+      t += theme.fg("accent", `"${(args.pattern ?? "").replace(/^@/, "")}"`);
+      t += theme.fg("dim", ` across ${addedDirs.length} dir(s)`);
+      return new Text(t, 0, 0);
+    },
+    renderResult(result, { expanded }, theme) {
+      const d = result.details as { totalFound?: number; pattern?: string; dirCount?: number } | undefined;
+      if (!d || !d.totalFound) {
+        const t = result.content?.[0];
+        return new Text(theme.fg("muted", t && "text" in t ? t.text : "No results"), 0, 0);
+      }
+      let txt = theme.fg("success", `✓ ${d.totalFound} file(s)`);
+      txt += theme.fg("dim", ` matching "${d.pattern}" in ${d.dirCount} dir(s)`);
+      if (expanded) {
+        const t = result.content?.[0];
+        if (t && "text" in t) txt += "\n" + theme.fg("muted", t.text);
+      }
+      return new Text(txt, 0, 0);
     },
   });
 }
