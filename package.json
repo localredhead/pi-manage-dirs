@@ -1,0 +1,22 @@
+{
+  "name": "pi-manage-dirs",
+  "version": "1.0.0",
+  "description": "Add directories to Pi's workspace context with interactive path autocompletion",
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "extensions"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "license": "MIT"
+}
