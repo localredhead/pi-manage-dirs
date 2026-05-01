@@ -1,7 +1,7 @@
 {
   "name": "pi-manage-dirs",
   "version": "1.0.0",
-  "description": "Add directories to Pi's workspace context with interactive path autocompletion",
+  "description": "Add external directories to Pi's workspace context with interactive path autocompletion, AGENTS.md loading, and skill registration",
   "keywords": [
     "pi-package"
   ],
