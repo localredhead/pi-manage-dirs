@@ -86,7 +86,8 @@ function readFileSafe(filePath: string): string | null {
 }
 
 function resolveDir(input: string, cwd: string): string {
-  const resolved = isAbsolute(input) ? input : resolve(cwd, input);
+  const expanded = expandTilde(input);
+  const resolved = isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
   try { return resolve(resolved); }
   catch { return resolved; }
 }
@@ -212,7 +213,9 @@ async function listDirectory(
       if (filter && !entry.name.toLowerCase().startsWith(filter.toLowerCase())) continue;
       const isDir = entry.isDirectory();
       let value = join(dirPath, entry.name) + (isDir ? "/" : "");
-      if (rebasePrefix && dirPath.startsWith("/")) value = rebasePrefix + value.slice(dirPath.length);
+      if (rebasePrefix) {
+        value = rebasePrefix + entry.name + (isDir ? "/" : "");
+      }
       items.push({ value, label: `${isDir ? "📁" : "📄"} ${entry.name}` });
     }
     items.sort((a, b) => {
@@ -232,7 +235,10 @@ function getCompletions(prefix: string, cwd: string): Promise<AutocompleteItem[]
   const hasSlash = t.endsWith("/") || t.endsWith("\\");
   const basePath = hasSlash ? full : dirname(full);
   const filter = hasSlash ? "" : (full.split(/[/\\]/).pop() || "");
-  const tildePrefix = expanded !== t ? t.slice(0, t.indexOf("/") + 1) : "";
+  const tildePrefix = expanded !== t
+    ? (t.endsWith("/") || t.endsWith("\\")
+      ? t
+      : t.slice(0, t.lastIndexOf("/") + 1)) : "";
   return listDirectory(basePath, filter, tildePrefix);
 }
 
