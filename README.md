@@ -20,47 +20,28 @@ Then `/reload` in Pi.
 
 ## Usage
 
-### Add directories with Tab completion
+### Unified `/manage-dirs` command
+
+Everything lives under one command with subcommand routing and Tab completion:
 
 ```
-/add-dir ~/        ← press Tab to browse your home directory
-/add-dir ~/Doc     ← press Tab to autocomplete to ~/Documents/
-/add-dir /usr/local/
+/manage-dirs                  ← interactive suggestions
+/manage-dirs ~/org            ← add a directory (Tab to navigate)
+/manage-dirs ls               ← list added directories
+/manage-dirs rm 0             ← remove by index
+/manage-dirs rm org           ← remove by label
+/manage-dirs suggest          ← scored project-aware suggestions
+/manage-dirs help             ← show all subcommands
 ```
 
-### Smart suggestions
+### Tab completion
 
-Run `/add-dir` with no arguments to see project-aware suggestions:
+When typing a path after `/manage-dirs`, press **Tab** to navigate directory trees:
 
-- Sibling projects in the same git repo
-- Local dependencies (`file:`, `link:`, `portal:` in package.json, `path:` in Cargo.toml, etc.)
-- Workspace members (npm, pnpm, Cargo, Go, uv, etc.)
-- Directories with AGENTS.md/CLAUDE.md or skills
-
-### Commands
-
-| Command | Description |
-|---------|-------------|
-| `/add-dir <path>` | Add a directory with path Tab completion |
-| `/add-dir` (no args) | Interactive mode with smart suggestions |
-| `/add-dir ls` | List all added directories |
-| `/add-dir rm <index>` | Remove directory by index |
-| `/dirs` | List external directories with context details |
-| `/remove-dir [path]` | Remove a directory (interactive picker or tab-completion) |
-| `/suggest-dirs` | Show scored directory suggestions based on project structure |
-
-### LLM Tools
-
-| Tool | Description |
-|------|-------------|
-| `add_directory` | Add an external directory (loads AGENTS.md, skills, etc.) |
-| `search_external_files` | Search for files across external directories by name pattern |
-
-The agent can request adding directories on its own:
-> "I need to reference the shared library — let me add it."
-
-And search across external dirs:
-> "Let me search for config files across the external directories."
+```
+/manage-dirs ~/          Tab → browse home dirs
+/manage-dirs ~/Doc       Tab → ~/Documents/
+```
 
 ## How It Works
 
@@ -72,21 +53,27 @@ When you add a directory, pi-manage-dirs scans it for:
 | `CLAUDE.md` | `<dir>/CLAUDE.md`, `<dir>/.pi/CLAUDE.md` |
 | Skills | `<dir>/.pi/skills/*/SKILL.md`, `<dir>/.agents/skills/*/SKILL.md`, `<dir>/.claude/skills/*/SKILL.md` |
 
-Context files are injected into the system prompt on every turn (cached — filesystem is only re-scanned when directories change).
+Context files are injected into the system prompt on every turn (cached). Skills are registered natively via `resources_discover`.
 
-Skills are registered natively with Pi via the `resources_discover` event, so they appear as `/skill:name` commands with full autocomplete support.
+## Smart Suggestions
+
+Run `~` or `/manage-dirs suggest` to get project-aware recommendations:
+
+- Sibling projects in the same git repo
+- Local dependencies (`file:`, `link:`, `portal:` in package.json, `path:` in Cargo.toml, etc.)
+- Workspace members (npm, pnpm, Cargo, Go, uv)
+- Directories with AGENTS.md/CLAUDE.md or skills
 
 ## Features
 
-- **Breadcrumb autocomplete** — type `~/` and Tab through subdirs without guessing full paths
-- **Smart suggestions** — project-aware recommendations based on dependencies, workspace structure, git repos, and context files
-- **Context injection** — AGENTS.md and CLAUDE.md from added directories are loaded into the agent's system prompt
-- **Skill registration** — skills discovered in added directories work as `/skill:name` commands
-- **Status widget** — shows active external directories above the editor
-- **LLM tools** — the agent can request adding directories (`add_directory`) and search files across them (`search_external_files`)
-- **Session persistence** — directories survive `/resume` and restarts
-- **Caching** — filesystem is only re-scanned when directories are added/removed, not on every turn
-- **Zero overhead when empty** — hooks return early if no directories are added
+- **Breadcrumb autocomplete** with `~/` home expansion
+- **Smart suggestions** from project structure analysis
+- **AGENTS.md / CLAUDE.md** context injection
+- **Skill registration** from external directories
+- **Status widget** showing active directories
+- **LLM tools**: `add_directory`, `search_external_files`
+- **Session persistence** across `/resume` and restarts
+- **Zero overhead** when no directories are added
 
 ## License
 
